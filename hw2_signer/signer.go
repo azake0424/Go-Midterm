@@ -1,116 +1,131 @@
 package main
 
 import (
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 )
 
-var concurrency = 6
-
 func ExecutePipeline(jobs ...job) {
-	wg := &sync.WaitGroup{}
-	in := make(chan interface{})
+	in := make(chan interface{}, 100)
+	out := make(chan interface{}, 100)
 
+	wg := &sync.WaitGroup{}
 	for _, job := range jobs {
 		wg.Add(1)
-
-		out := make(chan interface{})
-		go jobWorker(job, in, out, wg)
+		go worker(wg, job, in, out)
 		in = out
+		out = make(chan interface{}, 100)
 	}
 
 	wg.Wait()
 }
 
-func jobWorker(job job, in, out chan interface{}, wg *sync.WaitGroup) {
-	defer wg.Done()
+func worker(waiter *sync.WaitGroup, j job, in, out chan interface{}) {
+	defer waiter.Done()
 	defer close(out)
-
-	job(in, out)
+	j(in, out)
 }
 
 func SingleHash(in, out chan interface{}) {
-	wg := &sync.WaitGroup{}
-	mu := &sync.Mutex{}
+	var mu sync.Mutex
+	wgSingleHash := &sync.WaitGroup{}
 
-	for i := range in {
-		wg.Add(1)
-		go singleHashJob(i, out, wg, mu)
+	for input := range in {
+		wgSingleHash.Add(1)
+		go func(in interface{}) {
+			defer wgSingleHash.Done()
+			value, ok := in.(int)
+			if !ok {
+				panic("sh: failed type assertion")
+			}
+			data := strconv.Itoa(value)
+
+			mu.Lock()
+			md5hash := DataSignerMd5(data)
+			mu.Unlock()
+
+			mData := map[string]string{
+				"data":    data,
+				"md5hash": md5hash,
+			}
+			nmData := make(map[string]string, 2)
+			wg := &sync.WaitGroup{}
+			for k := range mData {
+				wg.Add(1)
+				go func(key string) {
+					defer wg.Done()
+					hash := DataSignerCrc32(mData[key])
+					mu.Lock()
+					nmData[key] = hash
+					mu.Unlock()
+				}(k)
+			}
+			wg.Wait()
+
+			result := nmData["data"] + "~" + nmData["md5hash"]
+			out <- result
+		}(input)
 	}
-	wg.Wait()
-}
-
-func singleHashJob(in interface{}, out chan interface{}, wg *sync.WaitGroup, mu *sync.Mutex) {
-	defer wg.Done()
-	data := strconv.Itoa(in.(int))
-
-	mu.Lock()
-	md5Data := DataSignerMd5(data)
-	mu.Unlock()
-
-	crc32Chan := make(chan string)
-	go asyncCrc32Signer(data, crc32Chan)
-
-	crc32Data := <-crc32Chan
-	crc32Md5Data := DataSignerCrc32(md5Data)
-
-	out <- crc32Data + "~" + crc32Md5Data
-}
-
-func asyncCrc32Signer(data string, out chan string) {
-	out <- DataSignerCrc32(data)
+	wgSingleHash.Wait()
 }
 
 func MultiHash(in, out chan interface{}) {
-	const TH int = 6
-	wg := &sync.WaitGroup{}
+	wgMultiHash := &sync.WaitGroup{}
+	for input := range in {
+		wgMultiHash.Add(1)
+		go func(in interface{}) {
+			defer wgMultiHash.Done()
+			data, ok := in.(string)
+			if !ok {
+				panic("mh: failed type assertion")
+			}
+			wg := &sync.WaitGroup{}
+			mu := &sync.Mutex{}
 
-	for i := range in {
-		wg.Add(1)
-		go multiHashJob(i.(string), out, TH, wg)
+			mData := make(map[int]string, 6)
+			for th := 0; th < 6; th++ {
+				wg.Add(1)
+				go func(mData map[int]string, th int, data string) {
+					defer wg.Done()
+					hash := DataSignerCrc32(strconv.Itoa(th) + data)
+					mu.Lock()
+					mData[th] = hash
+					mu.Unlock()
+				}(mData, th, data)
+			}
+			wg.Wait()
+
+			keys := make([]int, 0, len(mData))
+			for k, _ := range mData {
+				keys = append(keys, k)
+			}
+			sort.Ints(keys)
+
+			var result string
+			for k := range keys {
+				result += mData[k]
+			}
+
+			out <- result
+		}(input)
 	}
-	wg.Wait()
-}
-
-func multiHashJob(in string, out chan interface{}, th int, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	mu := &sync.Mutex{}
-	jobWg := &sync.WaitGroup{}
-	combinedChunks := make([]string, th)
-
-	for i := 0; i < th; i++ {
-		jobWg.Add(1)
-		data := strconv.Itoa(i) + in
-
-		go func(acc []string, index int, data string, jobWg *sync.WaitGroup, mu *sync.Mutex) {
-			defer jobWg.Done()
-			data = DataSignerCrc32(data)
-
-			mu.Lock()
-			acc[index] = data
-			mu.Unlock()
-		}(combinedChunks, i, data, jobWg, mu)
-	}
-
-	jobWg.Wait()
-	out <- strings.Join(combinedChunks, "")
+	wgMultiHash.Wait()
 }
 
 func CombineResults(in, out chan interface{}) {
-	var result []string
+	var hashes []string
+	for input := range in {
+		data, ok := input.(string)
+		if !ok {
+			panic("cr: failed type assertion")
+		}
 
-	for i := range in {
-		result = append(result, i.(string))
+		hashes = append(hashes, data)
 	}
+	sort.Strings(hashes)
 
-	sort.Strings(result)
-	out <- strings.Join(result, "_")
-}
-
-func main() {
-	fmt.Println("pew")
+	result := strings.Join(hashes, "_")
+	out <- result
 }
